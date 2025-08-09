@@ -9,6 +9,8 @@
 #include "../include/nt.hh"
 #include "../include/hook.hh"
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>  // 添加文件sink头文件
+#include <spdlog/sinks/stdout_color_sinks.h> // 添加控制台sink头文件
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -17,21 +19,40 @@
 #include <filesystem>
 #include "../include/redirect.hh"
 
-
 static def_CreateFileW Org_CreateFileW = NULL;
 static def_ReadFile Org_ReadFile = NULL;
 
 std::map<std::string, RedirectInfo> config;
-//  = {
-//     {
-//             std::string("program\\resources\\app\\app_launcher\\index.js"),
-//             {
-//                 std::string("index.js"),
-//                 "require('./launcher.node').load('external_index', module);",
-//                 0, 0, 1
-//             }
-//         },
-// };
+
+// 初始化日志系统
+void init_logger() {
+    try {
+        // 创建控制台和文件的双重sink
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("hook_log.txt", true);
+        
+        // 创建组合logger
+        std::vector<spdlog::sink_ptr> sinks{console_sink, file_sink};
+        auto combined_logger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
+        
+        // 设置日志格式
+        combined_logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [thread %t] %v");
+        
+        // 设置日志级别
+        combined_logger->set_level(spdlog::level::debug);
+        
+        // 设置为默认logger
+        spdlog::set_default_logger(combined_logger);
+        
+        // 刷新所有日志
+        spdlog::flush_every(std::chrono::seconds(3));
+        
+        spdlog::info("Logger initialized successfully");
+    } catch (const spdlog::spdlog_ex& ex) {
+        MessageBoxA(nullptr, ex.what(), "Logger initialization failed!", MB_ICONERROR | MB_OK);
+        exit(1);
+    }
+}
 
 HANDLE WINAPI Hk_CreateFileW(
     _In_           LPCWSTR                lpFileName,
@@ -46,100 +67,88 @@ HANDLE WINAPI Hk_CreateFileW(
     size_t len;
     wcstombs_s(&len, path, MAX_PATH, lpFileName, wcslen(lpFileName));
     std::string filename(path, len);
-    spdlog::info("full filename: {}", filename.c_str());
+    spdlog::debug("Attempting to open file: {}", filename.c_str());
     
     std::filesystem::path p(filename);
 
-    if (p.is_absolute())
-    {
-        // 绝对路径
+    if (p.is_absolute()) {
         if (filename.find("\\\\?\\") == 0) {
             filename.replace(0, 4, "");
+            spdlog::debug("Removed \\\\?\\ prefix: {}", filename);
         }
-        if ('a' <= filename[0] && filename[0] <= 'z')
-        {
+        if ('a' <= filename[0] && filename[0] <= 'z') {
             filename[0] = 'A' + filename[0] - 'a';
+            spdlog::debug("Converted drive letter to uppercase: {}", filename);
         }
-        spdlog::info("Absolute path: {}", filename.c_str());
     }
 
-    if (config.find(filename.c_str()) != config.end())
-    {
-        spdlog::info("File config was found: {}", filename);
+    if (config.find(filename.c_str()) != config.end()) {
         auto directData = config[filename.c_str()];
-        if (directData.cur >= directData.start && directData.cur < directData.end)
-        {
-            spdlog::info("{} Redirect for: {}", directData.cur, filename);
-            // 文件名
-
-            const char	*strTmpPath = directData.target.c_str();
-            spdlog::info("{} Redirect to: {}", directData.cur, strTmpPath);
-            directData.cur++;
-
+        spdlog::debug("Found redirect config for: {}, cur={}, start={}, end={}", 
+                     filename, directData.cur, directData.start, directData.end);
+        
+        if (directData.cur >= directData.start && directData.cur < directData.end) {
+            spdlog::info("Redirecting {} to {}", filename, directData.target);
+            
+            const char* strTmpPath = directData.target.c_str();
             int cap = (strlen(strTmpPath) + 1) * sizeof(wchar_t);
-            wchar_t *defaultIndex = (wchar_t *)malloc(cap);
+            wchar_t* defaultIndex = (wchar_t*)malloc(cap);
             size_t retlen = 0;
             
             errno_t err = mbstowcs_s(&retlen, defaultIndex, cap / sizeof(wchar_t), strTmpPath, _TRUNCATE);
 
+            directData.cur++;
             config[filename.c_str()] = directData;
+            
             if (err == 0) {
-                HANDLE ret = Org_CreateFileW(defaultIndex, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+                HANDLE ret = Org_CreateFileW(defaultIndex, dwDesiredAccess, dwShareMode, 
+                                            lpSecurityAttributes, dwCreationDisposition, 
+                                            dwFlagsAndAttributes, hTemplateFile);
                 free(defaultIndex);
                 return ret;
             }
-
-            // BOOL readResult = ReadFile(ret, msg, 20, NULL, NULL);
-            spdlog::info("read result: {}\n", err);
-            // 释放
+            
+            spdlog::error("Failed to convert path: {}, error: {}", strTmpPath, err);
             free(defaultIndex);
-        }
-        else {
-            spdlog::info("skip target: {}, cur: {}, start: {}, end: {}", directData.target, directData.cur, directData.start, directData.end);
+        } else {
             directData.cur++;
             config[filename.c_str()] = directData;
+            spdlog::debug("Skipping redirect for {} (cur={})", filename, directData.cur);
         }
-        
-    }
-    else {
-        spdlog::info("Can not find file config: {}", filename.c_str());
+    } else {
+        spdlog::debug("No redirect config found for: {}", filename);
     }
 
-    return Org_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    return Org_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, 
+                          lpSecurityAttributes, dwCreationDisposition, 
+                          dwFlagsAndAttributes, hTemplateFile);
 }
-
-
-BOOL WINAPI Hk_ReadFile(
-    _In_                HANDLE       hFile,
-    _Out_               LPVOID       lpBuffer,
-    _In_                DWORD        nNumberOfBytesToRead,
-    _Out_opt_     LPDWORD      lpNumberOfBytesRead,
-    _In_opt_ LPOVERLAPPED lpOverlapped
-) {
-    return Org_ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped);
-}
-
 
 void start_hook() {
-    spdlog::info("hook init");
+    init_logger();  // 初始化日志系统
+    
+    spdlog::info("Initializing hook system");
+    
     if (MH_Initialize() != MH_OK) {
+        spdlog::critical("MH_Initialize failed");
         MessageBoxA(nullptr, "MH Init Error!", "ERROR", MB_ICONERROR | MB_OK);
         exit(1);
     }
-    spdlog::info("hook create");
-    if (MH_CreateHook(&CreateFileW, &Hk_CreateFileW, reinterpret_cast<LPVOID*>(&Org_CreateFileW)) != MH_OK) {
+    
+    spdlog::info("Creating hooks");
+    if (MH_CreateHook(&CreateFileW, &Hk_CreateFileW, 
+                     reinterpret_cast<LPVOID*>(&Org_CreateFileW)) != MH_OK) {
+        spdlog::critical("Failed to create CreateFileW hook");
         MessageBoxA(nullptr, "MH Hook CreateFileW failed!", "ERROR", MB_ICONERROR | MB_OK);
         exit(1);
     }
-    // if (MH_CreateHook(&ReadFile, &Hk_ReadFile, reinterpret_cast<LPVOID*>(&Org_ReadFile)) != MH_OK) {
-    //     MessageBoxA(nullptr, "MH Hook CreateFileW failed!", "ERROR", MB_ICONERROR | MB_OK);
-    //     exit(1);
-    // }
     
-    spdlog::info("hook enable");
+    spdlog::info("Enabling hooks");
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        spdlog::critical("Failed to enable hooks");
         MessageBoxA(nullptr, "MH enable all hooks failed!", "ERROR", MB_ICONERROR | MB_OK);
         exit(1);
     }
-    spdlog::info("hook done");
+    
+    spdlog::info("Hook system initialized successfully");
 }
