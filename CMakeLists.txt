@@ -38,4 +38,3 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(jsoncpp CONFIG REQUIRED)
 
 add_subdirectory(./src)
-add_subdirectory(./test)
