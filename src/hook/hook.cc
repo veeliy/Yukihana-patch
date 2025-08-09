@@ -35,7 +35,6 @@ void log_redirect_config() {
         spdlog::info("  Current: {}", info.cur);
         spdlog::info("  Start: {}", info.start);
         spdlog::info("  End: {}", info.end);
-        spdlog::info("  Enabled: {}", info.enabled ? "true" : "false");
         spdlog::info("-------------------------------");
     }
     
